@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import numpy as np
 from gns import graph_network
+from gns.rigid_body import enforce_rigid_constraint
 from torch_geometric.nn import radius_graph
-from typing import Dict
+from torch import Tensor
+from typing import Dict, List, Optional
 
 
 class LearnedSimulator(nn.Module):
@@ -25,6 +27,7 @@ class LearnedSimulator(nn.Module):
         particle_type_embedding_size: int,
         boundary_clamp_limit: float = 1.0,
         device="cpu",
+        rigid_bodies: Optional[List[List[int]]] = None,
     ):
         """Initializes the model.
 
@@ -47,6 +50,7 @@ class LearnedSimulator(nn.Module):
           boundary_clamp_limit: a factor to enlarge connectivity radius used for computing
             normalized clipped distance in edge feature.
           device: Runtime device (cuda or cpu).
+          rigid_bodies: Optional list of rigid body particle index lists.
 
         """
         super(LearnedSimulator, self).__init__()
@@ -73,10 +77,60 @@ class LearnedSimulator(nn.Module):
         )
 
         self._device = device
+        self._rigid_bodies = None
+        if rigid_bodies is not None:
+            self._rigid_bodies = [
+                torch.tensor(indices, dtype=torch.long) for indices in rigid_bodies
+            ]
 
-    def forward(self):
-        """Forward hook runs on class instantiation"""
-        pass
+    @property
+    def rigid_bodies(self) -> Optional[List[Tensor]]:
+        """Return configured rigid body index tensors."""
+        return self._rigid_bodies
+
+    def set_rigid_bodies(self, rigid_bodies: List[List[int]]):
+        """Set rigid body indices dynamically."""
+        self._rigid_bodies = [
+            torch.tensor(indices, dtype=torch.long) for indices in rigid_bodies
+        ]
+
+    def forward(
+        self,
+        position_sequence: Tensor,
+        nparticles_per_example: Tensor,
+        particle_types: Tensor,
+        material_property: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Predict normalized acceleration and apply rigid body constraint."""
+        if material_property is not None:
+            node_features, edge_index, edge_features = self._encoder_preprocessor(
+                position_sequence,
+                nparticles_per_example,
+                particle_types,
+                material_property,
+            )
+        else:
+            node_features, edge_index, edge_features = self._encoder_preprocessor(
+                position_sequence, nparticles_per_example, particle_types
+            )
+
+        predicted_normalized_acceleration = self._encode_process_decode(
+            node_features, edge_index, edge_features
+        )
+
+        if self._rigid_bodies is not None:
+            rigid_bodies_on_device = [
+                idx.to(predicted_normalized_acceleration.device)
+                for idx in self._rigid_bodies
+            ]
+            current_positions = position_sequence[:, -1, :]
+            predicted_normalized_acceleration = enforce_rigid_constraint(
+                predicted_normalized_acceleration,
+                current_positions,
+                rigid_bodies_on_device,
+            )
+
+        return predicted_normalized_acceleration
 
     def _compute_graph_connectivity(
         self,
@@ -272,19 +326,11 @@ class LearnedSimulator(nn.Module):
         Returns:
           next_positions (torch.tensor): Next position of particles.
         """
-        if material_property is not None:
-            node_features, edge_index, edge_features = self._encoder_preprocessor(
-                current_positions,
-                nparticles_per_example,
-                particle_types,
-                material_property,
-            )
-        else:
-            node_features, edge_index, edge_features = self._encoder_preprocessor(
-                current_positions, nparticles_per_example, particle_types
-            )
-        predicted_normalized_acceleration = self._encode_process_decode(
-            node_features, edge_index, edge_features
+        predicted_normalized_acceleration = self.forward(
+            current_positions,
+            nparticles_per_example,
+            particle_types,
+            material_property,
         )
         next_positions = self._decoder_postprocessor(
             predicted_normalized_acceleration, current_positions
@@ -324,19 +370,11 @@ class LearnedSimulator(nn.Module):
         noisy_position_sequence = position_sequence + position_sequence_noise
 
         # Perform the forward pass with the noisy position sequence.
-        if material_property is not None:
-            node_features, edge_index, edge_features = self._encoder_preprocessor(
-                noisy_position_sequence,
-                nparticles_per_example,
-                particle_types,
-                material_property,
-            )
-        else:
-            node_features, edge_index, edge_features = self._encoder_preprocessor(
-                noisy_position_sequence, nparticles_per_example, particle_types
-            )
-        predicted_normalized_acceleration = self._encode_process_decode(
-            node_features, edge_index, edge_features
+        predicted_normalized_acceleration = self.forward(
+            noisy_position_sequence,
+            nparticles_per_example,
+            particle_types,
+            material_property,
         )
 
         # Calculate the target acceleration, using an `adjusted_next_position `that

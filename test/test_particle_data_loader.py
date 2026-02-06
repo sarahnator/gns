@@ -189,3 +189,84 @@ def test_data_loader_shuffle(dummy_npz_data):
     unshuffled_indices = list(iter(loader_no_shuffle.sampler))
 
     assert shuffled_indices != unshuffled_indices
+
+
+def test_particle_dataset_sample_mode_with_rigid_bodies(dummy_npz_data):
+    data_path, _ = dummy_npz_data
+    dataset = ParticleDataset(
+        data_path,
+        input_sequence_length=6,
+        mode="sample",
+        rigid_body_types=[0],
+    )
+
+    found_rigid = False
+    for i in range(min(10, len(dataset))):
+        features, _ = dataset[i]
+        if len(features) == 5:
+            rigid_bodies = features[4]
+            if rigid_bodies:
+                found_rigid = True
+                assert len(rigid_bodies) == 1
+                assert isinstance(rigid_bodies[0], torch.Tensor)
+                assert rigid_bodies[0].dtype == torch.int64
+                assert torch.equal(rigid_bodies[0], torch.tensor([0, 1, 2]))
+                break
+    assert found_rigid
+
+
+def test_get_data_loader_sample_mode_with_rigid_bodies(dummy_npz_data):
+    data_path, _ = dummy_npz_data
+    loader = get_data_loader(
+        data_path,
+        mode="sample",
+        batch_size=2,
+        rigid_body_types=[0],
+    )
+
+    features, labels = next(iter(loader))
+    assert labels.shape[0] > 0
+    # rigid bodies are optional by batch composition; if present they are tensor lists.
+    if len(features) == 5:
+        rigid_bodies = features[4]
+        assert isinstance(rigid_bodies, list)
+        for body_indices in rigid_bodies:
+            assert isinstance(body_indices, torch.Tensor)
+            assert body_indices.dtype == torch.int64
+
+
+def test_particle_dataset_trajectory_mode_no_rigid_bodies(dummy_npz_data):
+    data_path, original_data = dummy_npz_data
+    for i in range(len(original_data)):
+        original_data[i] = (original_data[i][0], np.full(3, 1), original_data[i][2])
+    np.savez(data_path, gns_data=np.array(original_data, dtype=object))
+
+    dataset = ParticleDataset(
+        data_path,
+        mode="trajectory",
+        rigid_body_types=[0],
+    )
+
+    trajectory = dataset[0]
+    assert len(trajectory) == 5
+    rigid_bodies = trajectory[4]
+    assert rigid_bodies == []
+
+
+def test_particle_dataset_rigid_body_types_config(dummy_npz_data):
+    data_path, original_data = dummy_npz_data
+    # Force all particles in first trajectory to type 3 (rigid under config).
+    original_data[0] = (original_data[0][0], np.full(3, 3), original_data[0][2])
+    np.savez(data_path, gns_data=np.array(original_data, dtype=object))
+
+    dataset = ParticleDataset(
+        data_path,
+        input_sequence_length=6,
+        mode="sample",
+        rigid_body_types=[3],  # guide-compatible config style
+    )
+
+    features, _ = dataset[0]
+    rigid_bodies = features[4]
+    assert len(rigid_bodies) == 1
+    assert torch.equal(rigid_bodies[0], torch.tensor([0, 1, 2]))

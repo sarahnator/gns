@@ -78,3 +78,49 @@ def test_encoder_preprocessor(simulator):
         (0, 0),
         (1, 1),
     }
+
+
+def test_rigid_body_configuration():
+    particle_dimensions = 2
+    nnode_in = 30
+    nedge_in = 3
+    latent_dim = 128
+    nmessage_passing_steps = 5
+    nmlp_layers = 2
+    mlp_hidden_dim = 64
+    connectivity_radius = 0.05
+    boundaries = np.array([[-1.0, 1.0], [-1.0, 1.0]])
+    normalization_stats = {
+        "acceleration": {"mean": 0.0, "std": 1.0},
+        "velocity": {"mean": 0.0, "std": 1.0},
+    }
+    nparticle_types = 1
+    particle_type_embedding_size = 16
+    boundary_clamp_limit = 1.0
+    device = "cpu"
+
+    model = LearnedSimulator(
+        particle_dimensions,
+        nnode_in,
+        nedge_in,
+        latent_dim,
+        nmessage_passing_steps,
+        nmlp_layers,
+        mlp_hidden_dim,
+        connectivity_radius,
+        boundaries,
+        normalization_stats,
+        nparticle_types,
+        particle_type_embedding_size,
+        boundary_clamp_limit,
+        device,
+        rigid_bodies=[[0, 1, 2]],
+    )
+
+    assert model.rigid_bodies is not None
+    assert len(model.rigid_bodies) == 1
+    assert torch.equal(model.rigid_bodies[0], torch.tensor([0, 1, 2], dtype=torch.long))
+
+    model.set_rigid_bodies([[1, 3]])
+    assert len(model.rigid_bodies) == 1
+    assert torch.equal(model.rigid_bodies[0], torch.tensor([1, 3], dtype=torch.long))

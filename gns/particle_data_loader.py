@@ -3,6 +3,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 import h5py
+from typing import List, Optional
 
 
 def load_data(path):
@@ -28,12 +29,53 @@ def load_data(path):
 
 
 class ParticleDataset(Dataset):
-    def __init__(self, file_path, input_sequence_length=6, mode="sample"):
+    def __init__(
+        self,
+        file_path,
+        input_sequence_length=6,
+        mode="sample",
+        rigid_body_types: Optional[List[int]] = None,
+    ):
         self.file_path = file_path
         self.input_sequence_length = input_sequence_length
         self.mode = mode
+        self.rigid_body_types = (
+            sorted(set(int(t) for t in rigid_body_types))
+            if rigid_body_types is not None
+            else []
+        )
+        self.include_rigid_bodies = len(self.rigid_body_types) > 0
         self.data = load_data(file_path)
         self._preprocess_data()
+
+    @staticmethod
+    def _expand_particle_feature(value, n_particles, dtype):
+        """Return a per-particle 1D array, supporting scalar or per-particle input."""
+        arr = np.asarray(value, dtype=dtype)
+        if arr.ndim == 0:
+            return np.full(n_particles, arr.item(), dtype=dtype)
+
+        arr = arr.reshape(-1)
+        if arr.size == 1:
+            return np.full(n_particles, arr.item(), dtype=dtype)
+        if arr.size == n_particles:
+            return arr.astype(dtype, copy=False)
+        raise ValueError(
+            f"Expected scalar or length-{n_particles} feature array, got shape {arr.shape}"
+        )
+
+    def _build_rigid_bodies(self, particle_type: np.ndarray) -> List[torch.Tensor]:
+        """
+        Build list of rigid body index tensors for this sample/trajectory.
+        Each particle type in `self.rigid_body_types` defines one rigid body.
+        """
+        rigid_bodies = []
+        for rigid_type in self.rigid_body_types:
+            rigid_indices = np.where(particle_type == rigid_type)[0]
+            if rigid_indices.size < 2:
+                continue
+            rigid_bodies.append(torch.from_numpy(rigid_indices.astype(np.int64)))
+        return rigid_bodies
 
     def _preprocess_data(self):
         self.dimension = self.data[0][0].shape[-1]
@@ -67,15 +109,18 @@ class ParticleDataset(Dataset):
             time_idx - self.input_sequence_length : time_idx
         ]
         positions = np.transpose(positions, (1, 0, 2))
-        particle_type = np.full(
-            positions.shape[0], self.data[trajectory_idx][1], dtype=int
+        particle_type = self._expand_particle_feature(
+            self.data[trajectory_idx][1], positions.shape[0], dtype=int
         )
 
         n_particles_per_example = positions.shape[0]
+        rigid_bodies = (
+            self._build_rigid_bodies(particle_type) if self.include_rigid_bodies else None
+        )
 
         if self.material_property_as_feature:
-            material_property = np.full(
-                positions.shape[0], self.data[trajectory_idx][2], dtype=float
+            material_property = self._expand_particle_feature(
+                self.data[trajectory_idx][2], positions.shape[0], dtype=float
             )
             features = (
                 positions,
@@ -85,6 +130,8 @@ class ParticleDataset(Dataset):
             )
         else:
             features = (positions, particle_type, n_particles_per_example)
+        if rigid_bodies is not None:
+            features = features + (rigid_bodies,)
 
         label = self.data[trajectory_idx][0][time_idx]
 
@@ -94,11 +141,18 @@ class ParticleDataset(Dataset):
         if self.material_property_as_feature:
             positions, particle_type, material_property = self.data[idx]
             positions = np.transpose(positions, (1, 0, 2))
-            particle_type = np.full(positions.shape[0], particle_type, dtype=int)
-            material_property = np.full(
-                positions.shape[0], material_property, dtype=float
+            particle_type = self._expand_particle_feature(
+                particle_type, positions.shape[0], dtype=int
+            )
+            material_property = self._expand_particle_feature(
+                material_property, positions.shape[0], dtype=float
             )
             n_particles_per_example = positions.shape[0]
+            rigid_bodies = (
+                self._build_rigid_bodies(particle_type)
+                if self.include_rigid_bodies
+                else None
+            )
 
             trajectory = (
                 torch.tensor(positions).to(torch.float32).contiguous(),
@@ -109,14 +163,24 @@ class ParticleDataset(Dataset):
         else:
             positions, particle_type = self.data[idx]
             positions = np.transpose(positions, (1, 0, 2))
-            particle_type = np.full(positions.shape[0], particle_type, dtype=int)
+            particle_type = self._expand_particle_feature(
+                particle_type, positions.shape[0], dtype=int
+            )
             n_particles_per_example = positions.shape[0]
+            rigid_bodies = (
+                self._build_rigid_bodies(particle_type)
+                if self.include_rigid_bodies
+                else None
+            )
 
             trajectory = (
                 torch.tensor(positions).to(torch.float32).contiguous(),
                 torch.tensor(particle_type).contiguous(),
                 n_particles_per_example,
             )
+
+        if rigid_bodies is not None:
+            trajectory = trajectory + (rigid_bodies,)
 
         return trajectory
 
@@ -137,15 +201,27 @@ def collate_fn_sample(batch):
     particle_type_list = []
     material_property_list = []
     n_particles_per_example_list = []
+    rigid_bodies_list = []
+    has_any_rigid_metadata = False
+    offset = 0
 
     for feature in features:
         position_list.append(feature[0])
         particle_type_list.append(feature[1])
-        if len(feature) == 4:  # If material property is present
+        has_rigid_bodies = isinstance(feature[-1], list)
+        has_any_rigid_metadata = has_any_rigid_metadata or has_rigid_bodies
+        base_feature_len = len(feature) - (1 if has_rigid_bodies else 0)
+
+        if base_feature_len == 4:  # If material property is present
             material_property_list.append(feature[2])
             n_particles_per_example_list.append(feature[3])
         else:
             n_particles_per_example_list.append(feature[2])
+        if has_rigid_bodies:
+            rigid_bodies = feature[-1]
+            for body_indices in rigid_bodies:
+                rigid_bodies_list.append(body_indices + offset)
+        offset += feature[0].shape[0]
 
     collated_features = (
         torch.tensor(np.vstack(position_list)).to(torch.float32).contiguous(),
@@ -162,6 +238,8 @@ def collate_fn_sample(batch):
         collated_features = (
             collated_features[:2] + (material_property_tensor,) + collated_features[2:]
         )
+    if has_any_rigid_metadata:
+        collated_features = collated_features + (rigid_bodies_list,)
 
     collated_labels = torch.tensor(np.vstack(labels)).to(torch.float32).contiguous()
 
@@ -179,6 +257,7 @@ def get_data_loader(
     batch_size=32,
     shuffle=True,
     use_dist=False,
+    rigid_body_types=None,
 ):
     """
     Get a data loader for the ParticleDataset.
@@ -190,11 +269,17 @@ def get_data_loader(
         batch_size (int): Batch size for the data loader.
         shuffle (bool): Whether to shuffle the data.
         use_dist (bool): Whether to use DistributedSampler for distributed training.
+        rigid_body_types (list[int] | None): Particle types that each define one rigid body.
 
     Returns:
         DataLoader: A PyTorch DataLoader object.
     """
-    dataset = ParticleDataset(file_path, input_sequence_length, mode)
+    dataset = ParticleDataset(
+        file_path,
+        input_sequence_length,
+        mode,
+        rigid_body_types,
+    )
 
     if use_dist:
         sampler = DistributedSampler(dataset, shuffle=shuffle)

@@ -106,6 +106,17 @@ def rollout(
     return output_dict, loss
 
 
+def _get_cfg_rigid_body_options(cfg: DictConfig):
+    return list(cfg.data.rigid_body_types) if len(cfg.data.rigid_body_types) > 0 else None
+
+
+def _set_simulator_rigid_bodies(simulator, use_dist, rigid_bodies):
+    if rigid_bodies is None:
+        return
+    model_ref = simulator.module if use_dist else simulator
+    model_ref.set_rigid_bodies([idx.tolist() for idx in rigid_bodies])
+
+
 def predict(device: str, cfg: DictConfig):
     """Predict rollouts.
 
@@ -145,7 +156,12 @@ def predict(device: str, cfg: DictConfig):
     )
 
     # Get dataset
-    ds = pdl.get_data_loader(file_path=f"{cfg.data.path}{split}.npz", mode="trajectory")
+    rigid_body_types = _get_cfg_rigid_body_options(cfg)
+    ds = pdl.get_data_loader(
+        file_path=f"{cfg.data.path}{split}.npz",
+        mode="trajectory",
+        rigid_body_types=rigid_body_types,
+    )
     # See if our dataset has material property as feature
     test_dataset = pdl.ParticleDataset(f"{cfg.data.path}{split}.npz")
     n_features = test_dataset.get_num_features()
@@ -174,11 +190,17 @@ def predict(device: str, cfg: DictConfig):
                 n_particles_per_example = torch.tensor(
                     [int(features[3])], dtype=torch.int32
                 ).to(device)
+                rigid_bodies = features[4] if len(features) > 4 else None
             else:
                 material_property = None
                 n_particles_per_example = torch.tensor(
                     [int(features[2])], dtype=torch.int32
                 ).to(device)
+                rigid_bodies = features[3] if len(features) > 3 else None
+
+            _set_simulator_rigid_bodies(
+                simulator, use_dist=False, rigid_bodies=rigid_bodies
+            )
 
             # Predict example rollout
             example_rollout, loss = rollout(
@@ -385,6 +407,7 @@ def initialize_training(cfg, rank, world_size, device, use_dist):
 
 
 def load_datasets(cfg, use_dist):
+    rigid_body_types = _get_cfg_rigid_body_options(cfg)
     # Train data loader
     train_dl = pdl.get_data_loader(
         file_path=f"{cfg.data.path}train.npz",
@@ -392,6 +415,7 @@ def load_datasets(cfg, use_dist):
         input_sequence_length=cfg.data.input_sequence_length,
         batch_size=cfg.data.batch_size,
         use_dist=use_dist,
+        rigid_body_types=rigid_body_types,
     )
     train_dataset = pdl.ParticleDataset(f"{cfg.data.path}train.npz")
     n_features = train_dataset.get_num_features()
@@ -405,6 +429,7 @@ def load_datasets(cfg, use_dist):
             input_sequence_length=cfg.data.input_sequence_length,
             batch_size=cfg.data.batch_size,
             use_dist=use_dist,
+            rigid_body_types=rigid_body_types,
         )
         valid_dataset = pdl.ParticleDataset(f"{cfg.data.path}valid.npz")
         if valid_dataset.get_num_features() != n_features:
@@ -444,21 +469,33 @@ def setup_tensorboard(cfg, metadata):
 
 def prepare_data(example, device_id):
     """Prepare data for training or validation."""
-    position = example[0][0].to(device_id)
-    particle_type = example[0][1].to(device_id)
+    feature = example[0]
+    position = feature[0].to(device_id)
+    particle_type = feature[1].to(device_id)
 
-    if len(example[0]) == 4:  # if data loader includes material_property
-        material_property = example[0][2].to(device_id)
-        n_particles_per_example = example[0][3].to(device_id)
-    elif len(example[0]) == 3:
+    has_rigid_bodies = isinstance(feature[-1], list)
+    base_feature_len = len(feature) - (1 if has_rigid_bodies else 0)
+
+    if base_feature_len == 4:  # if data loader includes material_property
+        material_property = feature[2].to(device_id)
+        n_particles_per_example = feature[3].to(device_id)
+    elif base_feature_len == 3:
         material_property = None
-        n_particles_per_example = example[0][2].to(device_id)
+        n_particles_per_example = feature[2].to(device_id)
     else:
         raise ValueError("Unexpected number of elements in the data loader")
+    rigid_bodies = feature[-1] if has_rigid_bodies else None
 
     labels = example[1].to(device_id)
 
-    return position, particle_type, material_property, n_particles_per_example, labels
+    return (
+        position,
+        particle_type,
+        material_property,
+        n_particles_per_example,
+        labels,
+        rigid_bodies,
+    )
 
 
 def train(rank, cfg, world_size, device, verbose, use_dist):
@@ -575,6 +612,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                         material_property,
                         n_particles_per_example,
                         labels,
+                        rigid_bodies,
                     ) = prepare_data(example, device_id)
 
                     n_particles_per_example = n_particles_per_example.to(device_id)
@@ -599,6 +637,7 @@ def train(rank, cfg, world_size, device, verbose, use_dist):
                         if use_dist
                         else simulator.predict_accelerations
                     )
+                    _set_simulator_rigid_bodies(simulator, use_dist, rigid_bodies)
                     pred_acc, target_acc = predict_fn(
                         next_positions=labels.to(device_or_rank),
                         position_sequence_noise=sampled_noise.to(device_or_rank),
@@ -821,6 +860,7 @@ def validation(simulator, example, n_features, cfg, rank, device_id, use_dist):
         material_property,
         n_particles_per_example,
         labels,
+        rigid_bodies,
     ) = prepare_data(example, device_id)
 
     # Sample the noise to add to the inputs.
@@ -840,6 +880,7 @@ def validation(simulator, example, n_features, cfg, rank, device_id, use_dist):
         if use_dist
         else simulator.predict_accelerations
     )
+    _set_simulator_rigid_bodies(simulator, use_dist, rigid_bodies)
     # Get the predictions and target accelerations
     with torch.no_grad():
         pred_acc, target_acc = predict_accelerations(

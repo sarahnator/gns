@@ -12,6 +12,7 @@ class DataConfig:
     input_sequence_length: int = 6
     num_particle_types: int = 9
     kinematic_particle_id: int = 3
+    rigid_body_types: list[int] = field(default_factory=list)
 
 
 @dataclass
