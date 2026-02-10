@@ -124,10 +124,12 @@ class LearnedSimulator(nn.Module):
                 for idx in self._rigid_bodies
             ]
             current_positions = position_sequence[:, -1, :]
+            current_velocities = position_sequence[:, -1, :] - position_sequence[:, -2, :]
             predicted_normalized_acceleration = enforce_rigid_constraint(
                 predicted_normalized_acceleration,
                 current_positions,
                 rigid_bodies_on_device,
+                velocities=current_velocities,
             )
 
         return predicted_normalized_acceleration

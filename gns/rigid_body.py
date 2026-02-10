@@ -16,6 +16,46 @@ def _cross_product_2d_scalar_vector(scalar: Tensor, v: Tensor) -> Tensor:
     return scalar * torch.stack([-v[:, 1], v[:, 0]], dim=-1)
 
 
+def _compute_angular_velocity_3d(
+    r: Tensor, velocities: Tensor, masses: Optional[Tensor], eps: float
+) -> Tensor:
+    """Estimate 3D angular velocity from relative positions and velocities."""
+    if masses is None:
+        mass_vec = torch.ones(r.shape[0], device=r.device, dtype=r.dtype)
+    else:
+        mass_vec = masses
+
+    total_mass = mass_vec.sum()
+    v_com = (mass_vec.unsqueeze(-1) * velocities).sum(dim=0) / total_mass
+    v_rel = velocities - v_com
+
+    inertia = compute_inertia_tensor_3d(r, mass_vec, eps)
+    angular_momentum = _cross_product_3d(
+        r, mass_vec.unsqueeze(-1) * v_rel
+    ).sum(dim=0)
+    return torch.linalg.solve(inertia, angular_momentum)
+
+
+def _compute_angular_velocity_2d(
+    r: Tensor, velocities: Tensor, masses: Optional[Tensor], eps: float
+) -> Tensor:
+    """Estimate 2D angular velocity (z scalar) from relative motion."""
+    if masses is None:
+        mass_vec = torch.ones(r.shape[0], device=r.device, dtype=r.dtype)
+    else:
+        mass_vec = masses
+
+    total_mass = mass_vec.sum()
+    v_com = (mass_vec.unsqueeze(-1) * velocities).sum(dim=0) / total_mass
+    v_rel = velocities - v_com
+
+    inertia = compute_inertia_scalar_2d(r, mass_vec, eps)
+    angular_momentum_z = (
+        r[:, 0] * (mass_vec * v_rel[:, 1]) - r[:, 1] * (mass_vec * v_rel[:, 0])
+    ).sum()
+    return angular_momentum_z / inertia
+
+
 def compute_center_of_mass(
     positions: Tensor, masses: Optional[Tensor] = None
 ) -> Tuple[Tensor, Tensor]:
@@ -97,20 +137,37 @@ def compute_rigid_body_state_2d(
 
 
 def reconstruct_particle_accelerations_3d(
-    a_com: Tensor, angular_accel: Tensor, r: Tensor
+    a_com: Tensor,
+    angular_accel: Tensor,
+    r: Tensor,
+    angular_velocity: Optional[Tensor] = None,
 ) -> Tensor:
     """Reconstruct 3D per-particle accelerations from rigid-body state."""
     alpha = angular_accel.unsqueeze(0).expand(r.shape[0], -1)
     a_rot = _cross_product_3d(alpha, r)
-    return a_com + a_rot
+
+    if angular_velocity is None:
+        a_cent = torch.zeros_like(r)
+    else:
+        omega = angular_velocity.unsqueeze(0).expand(r.shape[0], -1)
+        a_cent = _cross_product_3d(omega, _cross_product_3d(omega, r))
+
+    return a_com + a_rot + a_cent
 
 
 def reconstruct_particle_accelerations_2d(
-    a_com: Tensor, angular_accel: Tensor, r: Tensor
+    a_com: Tensor,
+    angular_accel: Tensor,
+    r: Tensor,
+    angular_velocity: Optional[Tensor] = None,
 ) -> Tensor:
     """Reconstruct 2D per-particle accelerations from rigid-body state."""
     a_rot = _cross_product_2d_scalar_vector(angular_accel, r)
-    return a_com + a_rot
+    if angular_velocity is None:
+        a_cent = torch.zeros_like(r)
+    else:
+        a_cent = -(angular_velocity**2) * r
+    return a_com + a_rot + a_cent
 
 
 def enforce_rigid_constraint(
@@ -119,8 +176,14 @@ def enforce_rigid_constraint(
     rigid_bodies: List[Tensor],
     masses: Optional[Tensor] = None,
     eps: float = 1e-6,
+    velocities: Optional[Tensor] = None,
 ) -> Tensor:
-    """Project rigid-body particles to accelerations consistent with rigid motion."""
+    """Project rigid-body particles to accelerations consistent with rigid motion.
+
+    If `velocities` is provided, angular velocity is estimated from current
+    rigid-body motion and centripetal acceleration is included. If omitted,
+    behavior falls back to translation + angular-acceleration terms only.
+    """
     if not rigid_bodies:
         return predicted_accelerations
 
@@ -143,9 +206,21 @@ def enforce_rigid_constraint(
         body_pos = positions[body_indices]
         body_accel = predicted_accelerations[body_indices]
         body_masses = masses[body_indices] if masses is not None else None
+        body_velocities = velocities[body_indices] if velocities is not None else None
 
         a_com, angular_accel, r, _ = compute_state(body_pos, body_accel, body_masses, eps)
-        result[body_indices] = reconstruct(a_com, angular_accel, r)
+        if body_velocities is None:
+            angular_velocity = None
+        elif dim == 3:
+            angular_velocity = _compute_angular_velocity_3d(
+                r, body_velocities, body_masses, eps
+            )
+        else:
+            angular_velocity = _compute_angular_velocity_2d(
+                r, body_velocities, body_masses, eps
+            )
+
+        result[body_indices] = reconstruct(a_com, angular_accel, r, angular_velocity)
 
 
     return result

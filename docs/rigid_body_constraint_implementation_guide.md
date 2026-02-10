@@ -58,16 +58,33 @@ Where:
 - `ω` = angular velocity
 - `r_i` = current position of particle i relative to COM
 
-**Simplification:** When constraining predicted accelerations (not integrating dynamics), we use:
+**Recommended implementation (for stable rotation):**
 
 ```
-a_i = a_com + α × r_i
+a_i = a_com + α × r_i + ω × (ω × r_i)
 ```
 
-The centripetal term `ω × (ω × r_i)` is omitted because:
-1. We don't track angular velocity explicitly
-2. The network's predictions already account for current motion state
-3. For small timesteps, this term is second-order
+You do not need to persist angular velocity in model state. Estimate instantaneous `ω`
+from the same position history already used by GNS:
+
+1. Compute per-particle velocity from recent positions (`dt=1` in current GNS code):
+```
+v_i ≈ x_i(t) - x_i(t-1)
+```
+2. Compute COM velocity and relative velocity:
+```
+v_com = (Σ m_i · v_i) / M
+v_rel,i = v_i - v_com
+```
+3. Compute angular momentum from relative motion and solve for `ω`:
+```
+L = Σ r_i × (m_i · v_rel,i)
+ω = (I + ε·I₃)⁻¹ · L    (3D)
+ω = L_z / (I + ε)       (2D)
+```
+
+If only a single position frame is available, fall back to `ω=0` (equivalent to the
+old behavior), but expect weaker rotational stability.
 
 ### 1.3 Computing Rigid Body State from Particle Accelerations
 
@@ -112,10 +129,10 @@ where ε ≈ 1e-6
 
 ### 1.4 Reconstructing Per-Particle Accelerations
 
-Once we have `a_com` and `α`, compute constrained accelerations:
+Once we have `a_com`, `α`, and `ω`, compute constrained accelerations:
 
 ```
-a_i^constrained = a_com + α × r_i
+a_i^constrained = a_com + α × r_i + ω × (ω × r_i)
 ```
 
 This ensures all particles move as a rigid unit.
@@ -151,12 +168,13 @@ This ensures all particles move as a rigid unit.
 │  │              RIGID BODY CONSTRAINT (Differentiable)               │   │
 │  │                                                                   │   │
 │  │  For each rigid body:                                             │   │
-│  │    1. Extract particle positions and predicted accelerations      │   │
+│  │    1. Extract positions, velocities, and predicted accelerations  │   │
 │  │    2. Compute COM acceleration: a_com = Σ(m_i·a_i) / M           │   │
 │  │    3. Compute torque: τ = Σ r_i × (m_i·a_i)                      │   │
 │  │    4. Compute inertia tensor: I = Σ m_i(|r|²I - r⊗r)            │   │
-│  │    5. Compute angular acceleration: α = I⁻¹τ                     │   │
-│  │    6. Reconstruct: a_i = a_com + α × r_i                         │   │
+│  │    5. Estimate angular velocity: ω = I⁻¹L from current velocities│   │
+│  │    6. Compute angular acceleration: α = I⁻¹τ                     │   │
+│  │    7. Reconstruct: a_i = a_com + α×r_i + ω×(ω×r_i)              │   │
 │  │                                                                   │   │
 │  │  Non-rigid particles: unchanged                                   │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
@@ -191,7 +209,7 @@ This ensures all particles move as a rigid unit.
 |----------|--------|-----------|
 | When to apply constraint | Forward pass (training + inference) | Consistency between training and rollout |
 | What to constrain | Accelerations | Network's actual output; forces are accelerations × mass |
-| Angular velocity estimation | Not used | Constraining accelerations, not integrating dynamics |
+| Angular velocity estimation | Estimated each step from position history | Needed for centripetal term without persistent state |
 | Inertia regularization | ε = 1e-6 | Prevents singular matrix for degenerate configurations |
 | Non-rigid particles | Pass through unchanged | Only modify particles belonging to rigid bodies |
 
@@ -202,7 +220,7 @@ This ensures all particles move as a rigid unit.
 ### 3.1 Pseudocode
 
 ```
-function enforce_rigid_constraint(predicted_accel, positions, rigid_bodies, masses):
+function enforce_rigid_constraint(predicted_accel, positions, rigid_bodies, masses, velocities=None):
     result = copy(predicted_accel)
 
     for body_indices in rigid_bodies:
@@ -233,16 +251,32 @@ function enforce_rigid_constraint(predicted_accel, positions, rigid_bodies, mass
         else:
             I = sum(m * |r|²)  # scalar
 
+        # Estimate angular velocity from current relative velocities (if available)
+        if velocities is not None:
+            vel = velocities[body_indices]      # (n_body, dim)
+            v_com = sum(m * vel) / M
+            v_rel = vel - v_com
+            if dim == 3:
+                L = sum(cross(r, m * v_rel))    # (3,)
+                ω = solve(I + ε*I₃, L)          # (3,)
+            else:
+                Lz = sum(r[:,0]*(m*v_rel)[:,1] - r[:,1]*(m*v_rel)[:,0])  # scalar
+                ω = Lz / (I + ε)
+        else:
+            ω = 0
+
         # Compute angular acceleration
         α = solve(I + ε*I, τ)  # I⁻¹τ with regularization
 
         # Reconstruct per-particle accelerations
         if dim == 3:
             a_rot = cross(α, r)  # (n_body, 3)
+            a_cent = cross(ω, cross(ω, r))  # (n_body, 3)
         else:
             a_rot = α * [-r[:,1], r[:,0]]  # (n_body, 2)
+            a_cent = -(ω**2) * r           # (n_body, 2)
 
-        constrained_accel = a_com + a_rot
+        constrained_accel = a_com + a_rot + a_cent
 
         # Write back
         result[body_indices] = constrained_accel
@@ -554,16 +588,18 @@ def compute_rigid_body_state_2d(
 def reconstruct_particle_accelerations_3d(
     a_com: Tensor,
     angular_accel: Tensor,
+    angular_velocity: Optional[Tensor],
     r: Tensor,
 ) -> Tensor:
     """
     Reconstruct per-particle accelerations from rigid body state (3D).
 
-    a_i = a_com + α × r_i
+    a_i = a_com + α × r_i + ω × (ω × r_i)
 
     Args:
         a_com: COM acceleration, shape (3,)
         angular_accel: Angular acceleration, shape (3,)
+        angular_velocity: Angular velocity, shape (3,) or None
         r: Relative positions, shape (n, 3)
 
     Returns:
@@ -577,25 +613,33 @@ def reconstruct_particle_accelerations_3d(
     # Rotational acceleration: α × r_i
     a_rot = _cross_product_3d(alpha_expanded, r)  # (n, 3)
 
+    if angular_velocity is None:
+        a_cent = torch.zeros_like(r)
+    else:
+        omega_expanded = angular_velocity.unsqueeze(0).expand(n, -1)  # (n, 3)
+        a_cent = _cross_product_3d(omega_expanded, _cross_product_3d(omega_expanded, r))
+
     # Total acceleration
-    return a_com + a_rot
+    return a_com + a_rot + a_cent
 
 
 def reconstruct_particle_accelerations_2d(
     a_com: Tensor,
     angular_accel: Tensor,
+    angular_velocity: Optional[Tensor],
     r: Tensor,
 ) -> Tensor:
     """
     Reconstruct per-particle accelerations from rigid body state (2D).
 
-    a_i = a_com + α × r_i
+    a_i = a_com + α × r_i - ω² r_i
 
     In 2D: α × r = [-α*r_y, α*r_x]
 
     Args:
         a_com: COM acceleration, shape (2,)
         angular_accel: Angular acceleration, scalar
+        angular_velocity: Angular velocity (scalar) or None
         r: Relative positions, shape (n, 2)
 
     Returns:
@@ -604,8 +648,10 @@ def reconstruct_particle_accelerations_2d(
     # Rotational acceleration
     a_rot = _cross_product_2d_scalar_vector(angular_accel, r)  # (n, 2)
 
+    a_cent = torch.zeros_like(r) if angular_velocity is None else -(angular_velocity ** 2) * r
+
     # Total acceleration
-    return a_com + a_rot
+    return a_com + a_rot + a_cent
 
 
 def enforce_rigid_constraint(
@@ -613,6 +659,7 @@ def enforce_rigid_constraint(
     positions: Tensor,
     rigid_bodies: List[Tensor],
     masses: Optional[Tensor] = None,
+    velocities: Optional[Tensor] = None,
     eps: float = 1e-6,
 ) -> Tensor:
     """
@@ -628,6 +675,8 @@ def enforce_rigid_constraint(
         rigid_bodies: List of 1D tensors, each containing indices of
                       particles belonging to one rigid body
         masses: Optional masses, shape (n_total,)
+        velocities: Optional current velocities, shape (n_total, dim).
+                    If None, centripetal term is skipped (ω=0 fallback).
         eps: Regularization for inertia computation
 
     Returns:
@@ -637,9 +686,12 @@ def enforce_rigid_constraint(
 
     Example:
         >>> positions = torch.randn(100, 3)
+        >>> velocities = torch.randn(100, 3)
         >>> accelerations = torch.randn(100, 3, requires_grad=True)
         >>> rigid_bodies = [torch.tensor([0,1,2,3]), torch.tensor([50,51,52])]
-        >>> constrained = enforce_rigid_constraint(accelerations, positions, rigid_bodies)
+        >>> constrained = enforce_rigid_constraint(
+        ...     accelerations, positions, rigid_bodies, velocities=velocities
+        ... )
         >>> loss = constrained.sum()
         >>> loss.backward()  # Gradients flow through
     """
@@ -672,6 +724,7 @@ def enforce_rigid_constraint(
 
         # Extract data for this body
         body_pos = positions[body_indices]
+        body_vel = velocities[body_indices] if velocities is not None else None
         body_accel = predicted_accelerations[body_indices]
         body_masses = masses[body_indices] if masses is not None else None
 
@@ -680,8 +733,27 @@ def enforce_rigid_constraint(
             body_pos, body_accel, body_masses, eps
         )
 
+        # Estimate angular velocity from current relative velocities
+        if body_vel is None:
+            angular_velocity = None
+        else:
+            v_com = (body_masses.unsqueeze(-1) * body_vel).sum(dim=0) / body_masses.sum() \
+                if body_masses is not None else body_vel.mean(dim=0)
+            v_rel = body_vel - v_com
+
+            if dim == 3:
+                inertia = compute_inertia_tensor_3d(r, body_masses if body_masses is not None else torch.ones(len(body_indices), device=device), eps)
+                mass_vec = body_masses if body_masses is not None else torch.ones(len(body_indices), device=device)
+                L = _cross_product_3d(r, mass_vec.unsqueeze(-1) * v_rel).sum(dim=0)
+                angular_velocity = torch.linalg.solve(inertia, L)
+            else:
+                mass_vec = body_masses if body_masses is not None else torch.ones(len(body_indices), device=device)
+                inertia = compute_inertia_scalar_2d(r, mass_vec, eps)
+                Lz = (r[:, 0] * (mass_vec * v_rel[:, 1]) - r[:, 1] * (mass_vec * v_rel[:, 0])).sum()
+                angular_velocity = Lz / inertia
+
         # Reconstruct constrained accelerations
-        constrained = reconstruct(a_com, angular_accel, r)
+        constrained = reconstruct(a_com, angular_accel, angular_velocity, r)
 
         # Write back (in-place modification of clone)
         result[body_indices] = constrained
@@ -890,12 +962,14 @@ class LearnedSimulator(nn.Module):
 
             # Get current positions (last timestep)
             current_positions = position_sequence[:, -1, :]
+            current_velocities = position_sequence[:, -1, :] - position_sequence[:, -2, :]
 
             predicted_accelerations = enforce_rigid_constraint(
                 predicted_accelerations,
                 current_positions,
                 rigid_bodies_on_device,
                 masses=None,  # Uniform masses; or pass actual masses
+                velocities=current_velocities,
             )
 
         return predicted_accelerations
