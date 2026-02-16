@@ -125,12 +125,33 @@ class LearnedSimulator(nn.Module):
             ]
             current_positions = position_sequence[:, -1, :]
             current_velocities = position_sequence[:, -1, :] - position_sequence[:, -2, :]
-            predicted_normalized_acceleration = enforce_rigid_constraint(
-                predicted_normalized_acceleration,
+
+            # Enforce rigid-body physics in physical acceleration units, then
+            # convert back to normalized units expected by training/loss code.
+            acceleration_stats = self._normalization_stats["acceleration"]
+            acc_mean = torch.as_tensor(
+                acceleration_stats["mean"],
+                device=predicted_normalized_acceleration.device,
+                dtype=predicted_normalized_acceleration.dtype,
+            )
+            acc_std = torch.as_tensor(
+                acceleration_stats["std"],
+                device=predicted_normalized_acceleration.device,
+                dtype=predicted_normalized_acceleration.dtype,
+            )
+            predicted_physical_acceleration = (
+                predicted_normalized_acceleration * acc_std
+            ) + acc_mean
+
+            constrained_physical_acceleration = enforce_rigid_constraint(
+                predicted_physical_acceleration,
                 current_positions,
                 rigid_bodies_on_device,
                 velocities=current_velocities,
             )
+            predicted_normalized_acceleration = (
+                constrained_physical_acceleration - acc_mean
+            ) / acc_std
 
         return predicted_normalized_acceleration
 

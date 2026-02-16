@@ -126,7 +126,7 @@ def test_rigid_body_configuration():
     assert torch.equal(model.rigid_bodies[0], torch.tensor([1, 3], dtype=torch.long))
 
 
-def test_forward_passes_current_velocities_to_rigid_constraint(monkeypatch):
+def test_forward_enforces_rigid_constraint_in_physical_units(monkeypatch):
     particle_dimensions = 2
     nnode_in = 30
     nedge_in = 3
@@ -137,7 +137,10 @@ def test_forward_passes_current_velocities_to_rigid_constraint(monkeypatch):
     connectivity_radius = 0.05
     boundaries = np.array([[-1.0, 1.0], [-1.0, 1.0]])
     normalization_stats = {
-        "acceleration": {"mean": 0.0, "std": 1.0},
+        "acceleration": {
+            "mean": torch.tensor([10.0, -3.0], dtype=torch.float32),
+            "std": torch.tensor([2.0, 4.0], dtype=torch.float32),
+        },
         "velocity": {"mean": 0.0, "std": 1.0},
     }
     nparticle_types = 1
@@ -172,14 +175,19 @@ def test_forward_passes_current_velocities_to_rigid_constraint(monkeypatch):
 
     class FakeEPD(torch.nn.Module):
         def forward(self, node_features, edge_index, edge_features):
-            return torch.zeros(node_features.shape[0], 2, dtype=node_features.dtype)
+            return torch.tensor(
+                [[1.5, -2.0], [0.5, 3.0]], dtype=node_features.dtype
+            )
 
     captured = {}
 
     def fake_enforce(predicted_accelerations, positions, rigid_bodies, masses=None, eps=1e-6, velocities=None):
+        captured["predicted_accelerations"] = predicted_accelerations.clone()
         captured["positions"] = positions.clone()
         captured["velocities"] = velocities.clone() if velocities is not None else None
-        return predicted_accelerations
+        return predicted_accelerations + torch.tensor(
+            [[2.0, -8.0], [2.0, -8.0]], dtype=predicted_accelerations.dtype
+        )
 
     monkeypatch.setattr(model, "_encoder_preprocessor", fake_preprocessor)
     monkeypatch.setattr(model, "_encode_process_decode", FakeEPD())
@@ -195,9 +203,20 @@ def test_forward_passes_current_velocities_to_rigid_constraint(monkeypatch):
     nparticles_per_example = torch.tensor([2], dtype=torch.long)
     particle_types = torch.zeros(2, dtype=torch.long)
 
-    _ = model(position_sequence, nparticles_per_example, particle_types)
+    output = model(position_sequence, nparticles_per_example, particle_types)
 
     expected_positions = position_sequence[:, -1, :]
     expected_velocities = position_sequence[:, -1, :] - position_sequence[:, -2, :]
+    expected_predicted_physical = torch.tensor(
+        [[13.0, -11.0], [11.0, 9.0]], dtype=torch.float32
+    )
+    expected_output_normalized = torch.tensor(
+        [[2.5, -4.0], [1.5, 1.0]], dtype=torch.float32
+    )
+
+    assert torch.allclose(
+        captured["predicted_accelerations"], expected_predicted_physical
+    )
     assert torch.allclose(captured["positions"], expected_positions)
     assert torch.allclose(captured["velocities"], expected_velocities)
+    assert torch.allclose(output, expected_output_normalized)
